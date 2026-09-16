@@ -44,18 +44,31 @@
 # ==============================================================================
 .equ PAIR_OFF_KEY,       0
 .equ PAIR_OFF_VALUE,     8
-.equ HEAD_PAIR_SIZE,    16
+.equ PAIR_OFF_KEYLEN,   16
+.equ PAIR_OFF_VALLEN,   20
+.equ HEAD_PAIR_SIZE,    24
 
 # ------------------------------------------------------------------------------
-# MACRO: DEF_HTTP_HEAD_PAIR name, key, key_len, value, value_len
-# Emits a 24-byte http_request_pair struct.
+# MACRO: DEF_HTTP_HEAD_PAIR name, key, value
+# Pushes strings into .rodata, calculates lengths at comptime,
+# and emits 24-byte struct in current section.
 # ------------------------------------------------------------------------------
-.macro DEF_HTTP_HEAD_PAIR name, key, key_len, value, value_len
+.macro DEF_HTTP_HEAD_PAIR name, key, value
+    .pushsection .rodata
+.Lkey_\@:
+    .ascii \key
+.Lkey_end_\@:
+
+.Lval_\@:
+    .ascii \value
+.Lval_end_\@:
+    .popsection
+
 \name:
-    .quad \key                          # +0: 64-bit Pointer to key buf
-    .quad \value                        # +8: 64-bit Pointer to value buf
-    .long \key_len                      # +16: 32-bit Integer for key length
-    .long \value_len                    # +20: 32-bit Integer for value length
+    .quad .Lkey_\@                          # +0:  64-bit Pointer to key buf in .rodata
+    .quad .Lval_\@                          # +8:  64-bit Pointer to value buf in .rodata
+    .long (.Lkey_end_\@ - .Lkey_\@)         # +16: 32-bit Compile-Time calculated key len
+    .long (.Lval_end_\@ - .Lval_\@)         # +20: 32-bit Compile-Time calculated value len
 .equ \name\()_len, 24
 .endm
 
@@ -272,20 +285,17 @@ ring_buffer: .zero 65536            # 64 KB ring-buffer for requests
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# MACRO: WRITE_RESP fd, http_response_reg
+# MACRO: WRITE_RESP fd, http_response_ptr
 # Writes resp_buf to client fd using length from http_response struct.
 #
 # Arguments:
 #   fd:                 Client socket FD (e.g. r13)
-#   http_response_reg:  Register holding pointer to http_response struct
+#   http_response_ptr:  Pointer to http_response struct
 # ------------------------------------------------------------------------------
-.macro WRITE_RESP fd, http_response_reg
-    LOAD_ADDR rax, \http_response_reg
+.macro WRITE_RESP fd, http_response_ptr
     mov rdi, \fd
-    mov rsi, [rax + RESP_OFF_BUF]
-    mov edx, [rax + RESP_OFF_LEN]
-    mov rax, SYS_WRITE
-    syscall
+    mov rsi, \http_response_ptr
+    call http_send_response
 .endm
 
 # ==============================================================================
@@ -316,6 +326,12 @@ _start:
     LOAD_ADDR rsi, scratchpad
     READ r13, rsi, 1024
 
+    # Build 200 OK response
+    sub rsp, HEAD_PAIR_SIZE
+    DEF_HTTP_HEAD_PAIR raw_200, "Content-Length: ", "5\r\n"
+    DEF_HTTP_RESP resp_ok, rsp, raw_200_len, body_buf=0, body_len=5, status=200, flags=(CT_HTML | FLAG_KEEPALIVE), ver=11
+    add rsp, HEAD_PAIR_SIZE
+
     # Write 200 OK
     WRITE_RESP r13, resp_ok
 
@@ -324,6 +340,41 @@ _start:
 
     # Exit program
     EXIT 0
+
+# ------------------------------------------------------------------------------
+# http_send_response(*http_response)
+# Use MACRO DEF_HTTP_RESP to instantiate a http response object.
+#
+# In:
+#   rdi = fd
+#   rsi = pointer to http_response buffer
+#
+# Out:
+#   rax = status (>= 0: bytes written, <0: error)
+#   ZF = 0: no errors, ZF = 1: error! Check out rax!
+#   Check out rax anyways as write is non-blocking and buf might be full!
+#
+#   errors in rax: -32: Broken Pipe, -104: Connection Reset by Peer; -11: Sending buf is full
+# ------------------------------------------------------------------------------
+http_send_response:
+    # Reserve 32 bytes for iovec[2]
+    sub rsp, 32
+
+    # Constructing iovec[2] for SYS_WRITEV
+    mov rax, [rsi + RESP_OFF_HEADER]
+    mov [rsp], rax
+    mov rax, [rsi + RESP_OFF_HEADLEN]
+    mov [rsp + 8], rax
+    mov rax, [rsi + RESP_OFF_BUF]
+    mov [rsp + 16], rax
+    mov rax, [rsi + RESP_OFF_LEN]
+    mov [rsp + 24], rax
+
+    # Syscall: writev(fd, iovec_ptr, 2)
+    WRITEV rdi, rsp, 2
+
+    add rsp, 32
+    ret
 
 # ------------------------------------------------------------------------------
 # http_parse_method
@@ -336,12 +387,6 @@ _start:
 # Out:
 #   rax = method enum (1=GET, 2=POST, -1=UNKNOWN)
 #   rdx = offset to first character of request path
-#
-# Clobbers:
-#   rcx, r8, r9
-#
-# Preserves:
-#   r12 - r15, rbx (SysV ABI compliant)
 # ------------------------------------------------------------------------------
 http_parse_method:
     ret
