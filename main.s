@@ -6,12 +6,13 @@
 .equ SYS_READ,       0
 .equ SYS_WRITE,      1
 .equ SYS_CLOSE,      3
-.equ SYS_SOCKET,     41
-.equ SYS_ACCEPT,     43
-.equ SYS_BIND,       49
-.equ SYS_LISTEN,     50
-.equ SYS_FORK,       57
-.equ SYS_EXIT,       60
+.equ SYS_WRITEV,    20
+.equ SYS_SOCKET,    41
+.equ SYS_ACCEPT,    43
+.equ SYS_BIND,      49
+.equ SYS_LISTEN,    50
+.equ SYS_FORK,      57
+.equ SYS_EXIT,      60
 
 .equ AF_INET,        2
 .equ SOCK_STREAM,    1
@@ -25,37 +26,6 @@
 # ==============================================================================
 # STRUCTS
 # ==============================================================================
-
-# ------------------------------------------------------------------------------
-# STRUCT: http_response (16 bytes, natural alignment)
-# Offset | Size | Field       | Description
-# -------+------+-------------+-------------------------------------------------
-# +0     | 8    | resp_buf    | 64-bit Pointer to response buffer (.quad)
-# +8     | 4    | resp_len    | 32-bit length of buffer in bytes (.long)
-# +12    | 2    | status_code | 16-bit HTTP status code (e.g. 200) (.word)
-# +14    | 2    | padding     | Alignment padding to keep 16 bytes (.word 0)
-# ------------------------------------------------------------------------------
-
-# ==============================================================================
-# STRUCT OFFSETS: http_response
-# ==============================================================================
-.equ RESP_OFF_BUF,     0
-.equ RESP_OFF_LEN,     8
-.equ RESP_OFF_STATUS, 12
-.equ HTTP_RESP_SIZE,  16
-
-# ------------------------------------------------------------------------------
-# MACRO: DEF_HTTP_RESP name, buf_label, buf_len, status=200
-# Emits a 16-byte http_response struct.
-# ------------------------------------------------------------------------------
-.macro DEF_HTTP_RESP name, buf_label, buf_len, status=200
-\name:
-    .quad \buf_label                    # +0: Pointer to Response buffer
-    .long \buf_len                      # +8: Length (32-Bit Integer)
-    .word \status                       # +12: Status code (16-Bit Integer; e.g., 200)
-    .word 0                             # +14: Padding to 16 bytes
-.equ \name\()_len, 16
-.endm
 
 # ------------------------------------------------------------------------------
 # STRUCT: http_request_pair (24 bytes, natural alignment)
@@ -89,15 +59,76 @@
 .equ \name\()_len, 24
 .endm
 
+# ------------------------------------------------------------------------------
+# STRUCT: http_response (32 bytes, natural alignment)
+# Offset | Size | Field       | Description
+# -------+------+-------------+-------------------------------------------------
+# +0     | 8    | header_buf  | 64-bit Pointer to response header buf (.quad)
+# +8     | 8    | resp_buf    | 64-bit Pointer to response buffer (.quad)
+# +16    | 4    | header_len  | 32-bit length of header buf (.long)
+# +20    | 4    | resp_len    | 32-bit length of buffer in bytes (.long)
+# +24    | 2    | status_code | 16-bit HTTP status code (e.g. 200) (.word)
+# +26    | 2    | http_ver    | 16-bit HTTP version (e.g., 11 or 21) (.word)
+# +28    | 4    | flags       | 32-bit Bitmask (Keep-Alive, Sendfile, etc.) (.long)
+# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# STRUCT OFFSETS: http_response
+# ==============================================================================
+.equ RESP_OFF_HEADER,   0
+.equ RESP_OFF_BUF,      8
+.equ RESP_OFF_HEADLEN, 16
+.equ RESP_OFF_LEN,     20
+.equ RESP_OFF_STATUS,  24
+.equ RESP_OFF_HTTPV,   26
+.equ RESP_OFF_FLAGS,   28
+.equ HTTP_RESP_SIZE,   32
+
+# ==============================================================================
+# HTTP RESPONSE FLAGS (Bitmask: Bits 0-15)
+# ==============================================================================
+.equ FLAG_NONE,         0
+.equ FLAG_KEEPALIVE,    (1 << 0)   # 1: "Connection: keep-alive", 0: "close"
+.equ FLAG_SENDFILE,     (1 << 1)   # body_buf is not a buffer, but a fd!
+.equ FLAG_NO_BODY,      (1 << 2)   # 204 No Content, 304 Not Modified, or HEAD-Request
+.equ FLAG_CHUNKED,      (1 << 3)   # "Transfer-Encoding: chunked" (no Content-Length; is removed)
+.equ FLAG_CORS,         (1 << 4)   # "Access-Control-Allow-Origin: *\r\n"
+.equ FLAG_NOCACHE,      (1 << 5)   # "Cache-Control: no-store\r\n"
+
+# ==============================================================================
+# CONTENT-TYPE ENUMS (Bits 16-23)
+# No string-lookups: Builder finds Header-String via Jump Table!
+# ==============================================================================
+.equ CT_SHIFT,          16
+.equ CT_NONE,           (0 << CT_SHIFT)
+.equ CT_HTML,           (1 << CT_SHIFT)   # "Content-Type: text/html; charset=utf-8\r\n"
+.equ CT_PLAIN,          (2 << CT_SHIFT)   # "Content-Type: text/plain; charset=utf-8\r\n"
+.equ CT_JSON,           (3 << CT_SHIFT)   # "Content-Type: application/json\r\n"
+.equ CT_OCTET,          (4 << CT_SHIFT)   # "Content-Type: application/octet-stream\r\n"
 
 # ------------------------------------------------------------------------------
-# MACRO: BUILD_HTTP_RESP name, status_code, http_header_ptr, body_buf_ptr=0
-# Emits a 16-byte http_response struct.
+# MACRO: DEF_HTTP_RESP
+# Arguments:
+#   name:        Label for the 32-Byte Struct
+#   header_buf:  Pointer to header buf
+#   header_len:  Length of header buffer
+#   body_buf:    Pointer to body (or fd for FLAG_SENDFILE)
+#   body_len:    Length of body buffer (0 for FLAG_SENDFILE / ignored)
+#   status:      HTTP Status Code (Default: 200)
+#   flags:       Combined Bitmaske (Default: CT_HTML | FLAG_KEEPALIVE)
+#   ver:         HTTP Version (Default: 11 for HTTP/1.1, 10 for 1.0)
 # ------------------------------------------------------------------------------
-.macro BUILD_HTTP_RESP name, status_code, http_header_ptr, body_buf_ptr=0
-    
+.macro DEF_HTTP_RESP name, header_buf, header_len, body_buf=0, body_len=0, status=200, flags=(CT_HTML | FLAG_KEEPALIVE), ver=11
+\name:
+    .quad \header_buf                   # +0:  Pointer to header_buf
+    .quad \body_buf                     # +8:  Pointer to body_buf OR fd (on FLAG_SENDFILE)
+    .long \header_len                   # +16: header_len
+    .long \body_len                     # +20: body_len
+    .word \status                       # +24: status_code (e.g., 200, 404)
+    .word \ver                          # +26: http_ver (e.g., 10, 11, 21)
+    .long \flags                        # +28: flags bitmask
+.equ \name\()_len, 32
 .endm
-
 
 # ==============================================================================
 # OPERATIONAL MACROS
@@ -200,6 +231,10 @@ ring_buffer: .zero 65536            # 64 KB ring-buffer for requests
 
 .macro WRITE fd, buf, count
     SYS3 SYS_WRITE, \fd, \buf, \count
+.endm
+
+.macro WRITEV fd, iov, iovcnt
+    SYS3 SYS_WRITEV, \fd, \iov, \iovcnt
 .endm
 
 .macro CLOSE fd
