@@ -27,51 +27,7 @@
 # STRUCTS
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# STRUCT: http_request_pair (24 bytes, natural alignment)
-# Tuple containing k/v pair.
-# ------------------------------------------------------------------------------
-# Offset | Size | Field       | Description
-# -------+------+-------------+-------------------------------------------------
-# +0     | 8    | key         | 64-bit Pointer to key buf (.quad)
-# +8     | 8    | value       | 64-bit Pointer to value buf (.quad)
-# +16    | 4    | key_len     | 32-bit Integer for key length (.long)
-# +20    | 4    | value_len   | 32-bit Integer for value length (.long)
-# ------------------------------------------------------------------------------
-
-# ==============================================================================
-# STRUCT OFFSETS: http_request_pair
-# ==============================================================================
-.equ PAIR_OFF_KEY,       0
-.equ PAIR_OFF_VALUE,     8
-.equ PAIR_OFF_KEYLEN,   16
-.equ PAIR_OFF_VALLEN,   20
-.equ HEAD_PAIR_SIZE,    24
-
-# ------------------------------------------------------------------------------
-# MACRO: DEF_HTTP_HEAD_PAIR name, key, value
-# Pushes strings into .rodata, calculates lengths at comptime,
-# and emits 24-byte struct in current section.
-# ------------------------------------------------------------------------------
-.macro DEF_HTTP_HEAD_PAIR name, key, value
-    .pushsection .rodata
-.Lkey_\@:
-    .ascii \key
-.Lkey_end_\@:
-
-.Lval_\@:
-    .ascii \value
-.Lval_end_\@:
-    .popsection
-
-\name:
-    .quad .Lkey_\@                          # +0:  64-bit Pointer to key buf in .rodata
-    .quad .Lval_\@                          # +8:  64-bit Pointer to value buf in .rodata
-    .long (.Lkey_end_\@ - .Lkey_\@)         # +16: 32-bit Compile-Time calculated key len
-    .long (.Lval_end_\@ - .Lval_\@)         # +20: 32-bit Compile-Time calculated value len
-.equ \name\()_len, 24
-.endm
-
+# TODO: remove? Actually useless.
 # ------------------------------------------------------------------------------
 # STRUCT: http_response (32 bytes, natural alignment)
 # Offset | Size | Field       | Description
@@ -131,7 +87,7 @@
 #   flags:       Combined Bitmaske (Default: CT_HTML | FLAG_KEEPALIVE)
 #   ver:         HTTP Version (Default: 11 for HTTP/1.1, 10 for 1.0)
 # ------------------------------------------------------------------------------
-.macro DEF_HTTP_RESP name, header_buf, header_len, body_buf=0, body_len=0, status=200, flags=(CT_HTML | FLAG_KEEPALIVE), ver=11
+.macro DEF_HTTP_RESP_OLD name, header_buf, header_len, body_buf=0, body_len=0, status=200, flags=(CT_HTML | FLAG_KEEPALIVE), ver=11
 \name:
     .quad \header_buf                   # +0:  Pointer to header_buf
     .quad \body_buf                     # +8:  Pointer to body_buf OR fd (on FLAG_SENDFILE)
@@ -141,6 +97,148 @@
     .word \ver                          # +26: http_ver (e.g., 10, 11, 21)
     .long \flags                        # +28: flags bitmask
 .equ \name\()_len, 32
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_INIT_RESP size=256
+# Reserves an aligned scratchpad on the stack and sets rdi as the write head.
+# size MUST be a multiple of 16 to preserve ABI stack alignment!
+# ------------------------------------------------------------------------------
+.macro HTTP_INIT_RESP size=256
+    sub rsp, \size
+    mov rdi, rsp
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_SEND_RESP fd, body_ptr, body_len, alloc_size=256
+# Computes header length, binds pointers to sys_writev, calls the sender,
+# and cleans up the stack scratchpad immediately after sending.
+# ------------------------------------------------------------------------------
+.macro HTTP_SEND_RESP fd, body_ptr, body_len, alloc_size=256
+    # 1. Compute header length before touching rdi
+    mov rdx, rdi
+    sub rdx, rsp                        # rdx = header length (bytes written)
+
+    # 2. Setup arguments for http_send_response
+    mov rsi, rsp                        # rsi = header buffer
+    mov rdi, \fd                        # rdi = client socket fd
+    mov rcx, \body_ptr                  # rcx = body pointer
+    mov r8, \body_len                   # r8 = body length
+
+    call http_send_response
+
+    # 3. Release scratchpad from stack AFTER sending
+    add rsp, \alloc_size
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE str
+# Writes arbitrary ASCII strings directly to [rdi] and advances rdi.
+# Clobbers: rsi, rcx
+# ------------------------------------------------------------------------------
+.macro HTTP_WRITE str
+    .pushsection .rodata
+.Lhw_\@:
+    .ascii "\str"
+.Lhw_end_\@:
+    .popsection
+
+    LOAD_ADDR rsi, .Lhw_\@
+    mov ecx, (.Lhw_end_\@ - .Lhw_\@)
+    rep movsb
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE_STATUS_LINE status=200, ver=11
+# Generates the status line at compile-time in .rodata and copies it to [rdi].
+# Clobbers: rsi, rcx
+# ------------------------------------------------------------------------------
+.macro HTTP_WRITE_STATUS_LINE status=200, ver=11
+    .pushsection .rodata
+.Lsl_\@:
+    .if \ver == 10
+        .ascii "HTTP/1.0 "
+    .elseif \ver == 11
+        .ascii "HTTP/1.1 "
+    .else
+        .ascii "HTTP/2 "
+    .endif
+
+    .if \status == 201
+        .ascii "201 Created\r\n"
+    .elseif \status == 204
+        .ascii "204 No Content\r\n"
+    .elseif \status == 400
+        .ascii "400 Bad Request\r\n"
+    .elseif \status == 404
+        .ascii "404 Not Found\r\n"
+    .elseif \status == 500
+        .ascii "500 Internal Server Error\r\n"
+    .else
+        .ascii "200 OK\r\n"
+    .endif
+.Lsl_end_\@:
+    .popsection
+
+    LOAD_ADDR rsi, .Lsl_\@
+    mov ecx, (.Lsl_end_\@ - .Lsl_\@)
+    rep movsb
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE_HEADER_KV key, val
+# Formats and writes "<key>: <val>\r\n" directly to [rdi] and advances rdi.
+# Clobbers: rsi, rcx
+# ------------------------------------------------------------------------------
+.macro HTTP_WRITE_HEADER_KV key, val
+    .pushsection .rodata
+.Lhkv_\@:
+    .ascii "\key"
+    .ascii ": "
+    .ascii "\val"
+    .ascii "\r\n"
+.Lhkv_end_\@:
+    .popsection
+
+    LOAD_ADDR rsi, .Lhkv_\@
+    mov ecx, (.Lhkv_end_\@ - .Lhkv_\@)
+    rep movsb
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE_CONTENT_LENGTH len
+# Writes "Content-Length: <len>\r\n" to [rdi] and advances rdi.
+# len can be a constant (e.g. 42) or a register (e.g. r15d).
+# Clobbers: rcx
+# ------------------------------------------------------------------------------
+.macro HTTP_WRITE_CONTENT_LENGTH len
+    # 1. Write "Content-" (8 bytes)
+    mov rax, 0x2d746e65746e6f43
+    mov [rdi], rax
+    add rdi, 8
+
+    # 2. Write "Length: " (8 bytes)
+    mov rax, 0x203a6874676e654c
+    mov [rdi], rax
+    add rdi, 8
+
+    # 3. Convert length to ASCII and append (assumes positive length)
+    mov rsi, \len
+    call itoa
+
+    # 4. Write CRLF
+    mov word ptr [rdi], 0x0a0d
+    add rdi, 2
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE_HEADER_END
+# Appends the final "\r\n" (2 bytes) to terminate the HTTP header block.
+# Clobbers: None
+# ------------------------------------------------------------------------------
+.macro HTTP_WRITE_HEADER_END
+    mov word ptr [rdi], 0x0a0d
+    add rdi, 2
 .endm
 
 # ==============================================================================
@@ -186,10 +284,8 @@
 
 DEF_SOCKADDR_IN sockaddr_any, 80, 0, 0, 0, 0
 
-# Default Response (200 OK)
-DEF_HTTP_HEADER raw_200_header, 0
-BUILD_HTTP_RESP resp_200, 200, raw_200_header, 0
-DEF_HTTP_RESP resp_ok, raw_200, raw_200_len, 200
+msg_hello: .ascii "hello"
+.equ msg_hello_len, . - msg_hello
 
 # ==============================================================================
 # BSS DATA
@@ -203,7 +299,7 @@ spsc_head:   .quad 0                # Head of ring buffer (producer-offset)
 .align 64
 spsc_tail:   .quad 0                # Tail of ring buffer (consumer-offset)
 .align 16
-ring_buffer: .zero 65536            # 64 KB ring-buffer for requests
+scratchpad:  .zero 65536            # 64 KB ring-buffer for requests
 
 # ==============================================================================
 # CORE SYSCALL MACROS
@@ -284,20 +380,6 @@ ring_buffer: .zero 65536            # 64 KB ring-buffer for requests
 # HTTP MACROS
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# MACRO: WRITE_RESP fd, http_response_ptr
-# Writes resp_buf to client fd using length from http_response struct.
-#
-# Arguments:
-#   fd:                 Client socket FD (e.g. r13)
-#   http_response_ptr:  Pointer to http_response struct
-# ------------------------------------------------------------------------------
-.macro WRITE_RESP fd, http_response_ptr
-    mov rdi, \fd
-    mov rsi, \http_response_ptr
-    call http_send_response
-.endm
-
 # ==============================================================================
 # HTTP ROUTING ENGINE
 # Dispatches incoming requests based on HTTP method and URI path.
@@ -326,51 +408,85 @@ _start:
     LOAD_ADDR rsi, scratchpad
     READ r13, rsi, 1024
 
-    # Build 200 OK response
-    sub rsp, HEAD_PAIR_SIZE
-    DEF_HTTP_HEAD_PAIR raw_200, "Content-Length: ", "5\r\n"
-    DEF_HTTP_RESP resp_ok, rsp, raw_200_len, body_buf=0, body_len=5, status=200, flags=(CT_HTML | FLAG_KEEPALIVE), ver=11
-    add rsp, HEAD_PAIR_SIZE
+    # --------------------------------------------------------------------------
+    # Clean Response Lifecycle
+    # --------------------------------------------------------------------------
+    # 1. Allocate 256-byte scratchpad & set rdi = rsp
+    HTTP_INIT_RESP 256
 
-    # Write 200 OK
-    WRITE_RESP r13, resp_ok
+    # 2. Stream headers lineraly to [rdi]
+    HTTP_WRITE_STATUS_LINE 200, 11
+    HTTP_WRITE_HEADER_KV "Server", "asm-core"
+    HTTP_WRITE_HEADER_KV "Content-Type", "text/plain"
+    HTTP_WRITE_CONTENT_LENGTH msg_hello_len
+    HTTP_WRITE_HEADER_END
 
-    # Close connection
+    # 3. Fire writev and immediately release the 256-byte stack frame
+    LOAD_ADDR rax, msg_hello
+    HTTP_SEND_RESP r13, rax, msg_hello_len, 256
+
+    # 4. Close connection
     CLOSE r13
 
     # Exit program
     EXIT 0
 
 # ------------------------------------------------------------------------------
-# http_send_response(*http_response)
-# Use MACRO DEF_HTTP_RESP to instantiate a http response object.
-#
+# itoa(u64 val)
+# Writes ASCII representation of rsi directly into [rdi] and advances rdi.
 # In:
-#   rdi = fd
-#   rsi = pointer to http_response buffer
-#
+#   rsi = unsigned 64-bit integer
+#   rdi = write head pointer
 # Out:
-#   rax = status (>= 0: bytes written, <0: error)
-#   ZF = 0: no errors, ZF = 1: error! Check out rax!
-#   Check out rax anyways as write is non-blocking and buf might be full!
-#
-#   errors in rax: -32: Broken Pipe, -104: Connection Reset by Peer; -11: Sending buf is full
+#   rdi = updated write head (pointing to next free byte)
+# Clobbers: rax, rcx, rdx, r8
+# ------------------------------------------------------------------------------
+itoa:
+    mov rax, rsi                        # Value to convert
+    mov r8, rsp                         # Anchor stack pointer
+    mov ecx, 10
+
+.Lextract_loop:
+    xor edx, edx
+    div rcx                             # TODO: div too slow!
+    add dl, '0'                         # Convert to ASCII
+    dec rsp
+    mov [rsp], al                       # Push signle byte to stack
+    test rax, rax
+    jnz .Lextract_loop
+
+.Lflush_loop:
+    mov al, [rsp]
+    mov [rdi], al                       # Read bytes in correct forward order
+    inc rdi                             # Write to buffer
+    inc rsp                             # Advance write head
+    cmp rsp, r8
+    jne .Lflush_loop
+
+    ret
+
+# ------------------------------------------------------------------------------
+# http_send_response(fd, header_buf, header_len, body_buf, body_len)
+# In:
+#   rdi = client_fd
+#   rsi = header buffer pointer
+#   rdx = header length
+#   rcx = body buffer pointer
+#   r8  = body length
+# Clobbers: rax, rcx, r11 (syscall)
 # ------------------------------------------------------------------------------
 http_send_response:
-    # Reserve 32 bytes for iovec[2]
-    sub rsp, 32
+    sub rsp, 32                         # 32 bytes for struct iovec[2]
 
-    # Constructing iovec[2] for SYS_WRITEV
-    mov rax, [rsi + RESP_OFF_HEADER]
-    mov [rsp], rax
-    mov rax, [rsi + RESP_OFF_HEADLEN]
-    mov [rsp + 8], rax
-    mov rax, [rsi + RESP_OFF_BUF]
-    mov [rsp + 16], rax
-    mov rax, [rsi + RESP_OFF_LEN]
-    mov [rsp + 24], rax
+    # iov[0] = Header
+    mov [rsp + 0], rsi
+    mov [rsp + 8], rdx
 
-    # Syscall: writev(fd, iovec_ptr, 2)
+    # iov[1] = Body
+    mov [rsp + 16], rcx
+    mov [rsp + 24], r8
+
+    # sys_writev(fd, iov, 2)
     WRITEV rdi, rsp, 2
 
     add rsp, 32

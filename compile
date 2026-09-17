@@ -1,0 +1,6 @@
+#!/bin/bash
+
+as -o server.o main.s
+ld -o server server.o
+
+rm server.o
