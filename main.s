@@ -17,7 +17,6 @@
 
 # HTTP
 .equ MAX_OTHER_HDRS,       16       # More than 16 custom headers: REQ_F_ERR_HDR_LIMIT
-.equ CUSTOM_HEADERS_CAP,   20       # First 20 custom non-default headers
 .equ READ_TIMEOUT,        500       # 500 ms
 .equ MAX_HEADER_SIZE,    1024       # 1 KB limit
 .equ MAX_BODY_SIZE,      1024       # 1 KB limit
