@@ -49,8 +49,13 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 # ==============================================================================
 
 # ==============================================================================
+# HTTP REQUEST STRUCT
+# ==============================================================================
+
+# ==============================================================================
 # STRUCT: http_request (Exactly 64 bytes / 1 Full CPU Cache Line)
 # Natural alignment preserved. Zero bytes wasted.
+# Layout: Flags -> URI/Query -> Headers -> Body -> Rest
 # ==============================================================================
 # Offset | Size | Field            | Description
 # -------+------+------------------+--------------------------------------------
@@ -67,14 +72,14 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 # +26    | 2    | cookie_len       | 16-bit length of Cookie value
 # +28    | 2    | ua_off           | 16-bit offset to User-Agent value
 # +30    | 2    | ua_len           | 16-bit length of User-Agent value
-# +32    | 4    | body_off         | 32-bit offset to Body start
-# +36    | 4    | body_len         | 32-bit byte count of Body
-# +40    | 8    | other_hdrs_ptr   | 64-bit pointer to unknown headers array
-# +48    | 4    | client_fd        | 32-bit client socket descriptor
-# +52    | 2    | content_type_off | 16-bit offset to Content-Type string
-# +54    | 2    | content_type_len | 16-bit length of Content-Type string
-# +56    | 2    | referer_off      | 16-bit offset to Referer value
-# +58    | 2    | referer_len      | 16-bit length of Referer value
+# +32    | 2    | content_type_off | 16-bit offset to Content-Type string
+# +34    | 2    | content_type_len | 16-bit length of Content-Type string
+# +36    | 2    | referer_off      | 16-bit offset to Referer value
+# +38    | 2    | referer_len      | 16-bit length of Referer value
+# +40    | 4    | body_off         | 32-bit offset to Body start
+# +44    | 4    | body_len         | 32-bit byte count of Body
+# +48    | 8    | other_hdrs_ptr   | 64-bit pointer to unknown headers array
+# +56    | 4    | client_fd        | 32-bit client socket descriptor
 # +60    | 2    | other_count      | Number of unknown headers parsed
 # +62    | 2    | client_port      | 16-bit client port (little endian)
 # ------------------------------------------------------------------------------
@@ -92,16 +97,16 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 .equ REQ_OFF_COOKIE_LEN,  26
 .equ REQ_OFF_UA_OFF,      28
 .equ REQ_OFF_UA_LEN,      30
-.equ REQ_OFF_BODY_OFF,    32
-.equ REQ_OFF_BODY_LEN,    36
-.equ REQ_OFF_OTHER_PTR,   40
-.equ REQ_OFF_CLIENT_FD,   48
-.equ REQ_OFF_CT_OFF,      52
-.equ REQ_OFF_CT_LEN,      54
-.equ REQ_OFF_REF_OFF,     56
-.equ REQ_OFF_REF_LEN,     58
+.equ REQ_OFF_CT_OFF,      32
+.equ REQ_OFF_CT_LEN,      34
+.equ REQ_OFF_REF_OFF,     36
+.equ REQ_OFF_REF_LEN,     38
+.equ REQ_OFF_BODY_OFF,    40
+.equ REQ_OFF_BODY_LEN,    44
+.equ REQ_OFF_OTHER_PTR,   48
+.equ REQ_OFF_CLIENT_FD,   56
 .equ REQ_OFF_OTHER_CNT,   60
-.equ REQ_OFF_OTHER_CAP,   62
+.equ REQ_OFF_CLIENT_PORT, 62
 .equ HTTP_REQ_SIZE,       64
 
 # ==============================================================================
