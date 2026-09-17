@@ -21,7 +21,10 @@
 # ==============================================================================
 # GLOBAL CONSTANTS
 # ==============================================================================
-.equ BACKLOG,        0
+.equ BACKLOG,         0
+.equ SOL_SOCKET,      1
+.equ SO_REUSEADDR,    2
+.equ SYS_SETSOCKOPT, 54
 
 # ==============================================================================
 # STRUCTS
@@ -350,6 +353,22 @@ scratchpad:  .zero 65536            # 64 KB ring-buffer for requests
     SYS1 SYS_CLOSE, \fd
 .endm
 
+# ------------------------------------------------------------------------------
+# SETSOCKOPT_REUSEADDR sockfd
+# Clobbers: rax, rdi, rsi, rdx, r10, r8, rcx, r11
+# ------------------------------------------------------------------------------
+.macro SETSOCKOPT_REUSEADDR sockfd
+    push 1                              # Value = 1 (enable) on stack
+    mov rdi, \sockfd                    # arg1: sockfd
+    mov rsi, SOL_SOCKET                 # arg2: level (1)
+    mov rdx, SO_REUSEADDR               # arg3: optname (2)
+    mov r10, rsp                        # arg4: optval pointer (&1)
+    mov r8, 4                           # arg5: optlen (sizeof(int) = 4)
+    mov rax, SYS_SETSOCKOPT             # syscall 54
+    syscall
+    pop r8                              # Restore stack
+.endm
+
 .macro SOCKET domain, type, protocol
     SYS3 SYS_SOCKET, \domain, \type, \protocol
 .endm
@@ -396,6 +415,9 @@ _start:
     SOCKET AF_INET, SOCK_STREAM, 0
     mov r12, rax
 
+    # Allow immediate rebinding even if in TIME_WAIT
+    SETSOCKOPT_REUSEADDR r12
+
     # Bind & listen to 0.0.0.0
     BIND r12, sockaddr_any
     LISTEN r12
@@ -416,7 +438,7 @@ _start:
 
     # 2. Stream headers lineraly to [rdi]
     HTTP_WRITE_STATUS_LINE 200, 11
-    HTTP_WRITE_HEADER_KV "Server", "asm-core"
+    HTTP_WRITE_HEADER_KV "Server", "asmhttp"
     HTTP_WRITE_HEADER_KV "Content-Type", "text/plain"
     HTTP_WRITE_CONTENT_LENGTH msg_hello_len
     HTTP_WRITE_HEADER_END
@@ -451,7 +473,7 @@ itoa:
     div rcx                             # TODO: div too slow!
     add dl, '0'                         # Convert to ASCII
     dec rsp
-    mov [rsp], al                       # Push signle byte to stack
+    mov [rsp], dl                       # Push signle byte to stack
     test rax, rax
     jnz .Lextract_loop
 
