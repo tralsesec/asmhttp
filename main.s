@@ -55,12 +55,11 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 # ==============================================================================
 # STRUCT: http_request (Exactly 64 bytes / 1 Full CPU Cache Line)
 # Natural alignment preserved. Zero bytes wasted.
-# Layout: Flags -> URI/Query -> Headers -> Body -> Rest
 # ==============================================================================
 # Offset | Size | Field            | Description
 # -------+------+------------------+--------------------------------------------
 # +0     | 8    | flags            | 64-bit Bitmask (Method, HTTP ver, VIP flags)
-# +8     | 2    | uri_off          | 16-bit offset to Path start (e.g. "/api/v1")
+# +8     | 2    | uri_off          | 16-bit offset to Path start
 # +10    | 2    | uri_len          | 16-bit length of Path (stops before '?')
 # +12    | 2    | query_off        | 16-bit offset to Query params (after '?')
 # +14    | 2    | query_len        | 16-bit length of Query params
@@ -76,8 +75,10 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 # +34    | 2    | content_type_len | 16-bit length of Content-Type string
 # +36    | 2    | referer_off      | 16-bit offset to Referer value
 # +38    | 2    | referer_len      | 16-bit length of Referer value
-# +40    | 4    | body_off         | 32-bit offset to Body start
-# +44    | 4    | body_len         | 32-bit byte count of Body
+# +40    | 4    | body_len         | 32-bit byte count of Body (aligned to 4)
+# +44    | 2    | body_off         | 16-bit offset to Body start (aligned to 2)
+# +46    | 1    | route_id         | 8-bit Target endpoint ID (0..255)
+# +47    | 1    | status_enum      | 8-bit Compact HTTP status enum (0..255)
 # +48    | 8    | other_hdrs_ptr   | 64-bit pointer to unknown headers array
 # +56    | 4    | client_fd        | 32-bit client socket descriptor
 # +60    | 2    | other_count      | Number of unknown headers parsed
@@ -101,13 +102,41 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 .equ REQ_OFF_CT_LEN,      34
 .equ REQ_OFF_REF_OFF,     36
 .equ REQ_OFF_REF_LEN,     38
-.equ REQ_OFF_BODY_OFF,    40
-.equ REQ_OFF_BODY_LEN,    44
+.equ REQ_OFF_BODY_LEN,    40
+.equ REQ_OFF_BODY_OFF,    44
+.equ REQ_OFF_ROUTE_ID,    46
+.equ REQ_OFF_STATUS_ENUM, 47
 .equ REQ_OFF_OTHER_PTR,   48
 .equ REQ_OFF_CLIENT_FD,   56
 .equ REQ_OFF_OTHER_CNT,   60
 .equ REQ_OFF_CLIENT_PORT, 62
 .equ HTTP_REQ_SIZE,       64
+
+# ==============================================================================
+# COMPACT HTTP STATUS ENUMS (8-bit)
+# ==============================================================================
+.equ STATUS_200_OK,                  0
+.equ STATUS_201_CREATED,             1
+.equ STATUS_204_NO_CONTENT,          2
+.equ STATUS_206_PARTIAL_CONTENT,     3
+.equ STATUS_301_MOVED_PERMANENTLY,   4
+.equ STATUS_302_FOUND,               5
+.equ STATUS_304_NOT_MODIFIED,        6
+.equ STATUS_400_BAD_REQUEST,         7
+.equ STATUS_401_UNAUTHORIZED,        8
+.equ STATUS_403_FORBIDDEN,           9
+.equ STATUS_404_NOT_FOUND,          10
+.equ STATUS_405_METHOD_NOT_ALLOWED, 11
+.equ STATUS_413_PAYLOAD_TOO_LARGE,  12
+.equ STATUS_415_UNSUPPORTED_MEDIA,  13
+.equ STATUS_416_RANGE_NOT_SATISFIED,14
+.equ STATUS_429_TOO_MANY_REQUESTS,  15
+.equ STATUS_431_HEADERS_TOO_LARGE,  16
+.equ STATUS_500_INTERNAL_ERROR,     17
+.equ STATUS_501_NOT_IMPLEMENTED,    18
+.equ STATUS_502_BAD_GATEWAY,        19
+.equ STATUS_503_SERVICE_UNAVAILABLE,20
+.equ STATUS_504_GATEWAY_TIMEOUT,    21
 
 # ==============================================================================
 # HTTP REQUEST FLAGS (64-bit Bitmask)
@@ -456,6 +485,42 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 .align 16
 
 DEF_SOCKADDR_IN sockaddr_any, 80, 0, 0, 0, 0
+
+# Macro to generate packed status descriptor entries
+.macro STATUS_ENTRY str
+    .quad .Lse_\@
+    .long (.Lse_end_\@ - .Lse_\@)
+    .long 0                             # 4 bytes padding to make each entry 16 bytes
+    .pushsection .rodata.str
+.Lse_\@:
+    .ascii "HTTP/1.1 \str\r\n"
+.Lse_end_\@:
+    .popsection
+.endm
+
+status_lookup_table:
+    STATUS_ENTRY "200 OK"
+    STATUS_ENTRY "201 Created"
+    STATUS_ENTRY "204 No Content"
+    STATUS_ENTRY "206 Partial Content"
+    STATUS_ENTRY "301 Moved Permanently"
+    STATUS_ENTRY "302 Found"
+    STATUS_ENTRY "304 Not Modified"
+    STATUS_ENTRY "400 Bad Request"
+    STATUS_ENTRY "401 Unauthorized"
+    STATUS_ENTRY "403 Forbidden"
+    STATUS_ENTRY "404 Not Found"
+    STATUS_ENTRY "405 Method Not Allowed"
+    STATUS_ENTRY "413 Payload Too Large"
+    STATUS_ENTRY "415 Unsupported Media Type"
+    STATUS_ENTRY "416 Range Not Satisfiable"
+    STATUS_ENTRY "429 Too Many Requests"
+    STATUS_ENTRY "431 Request Header Fields Too Large"
+    STATUS_ENTRY "500 Internal Server Error"
+    STATUS_ENTRY "501 Not Implemented"
+    STATUS_ENTRY "502 Bad Gateway"
+    STATUS_ENTRY "503 Service Unavailable"
+    STATUS_ENTRY "504 Gateway Timeout"
 
 # ==============================================================================
 # SYSCALL DEFINITIONS
