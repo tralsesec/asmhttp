@@ -21,8 +21,24 @@
 .equ MAX_HEADER_SIZE,    1024       # 1 KB limit
 .equ MAX_BODY_SIZE,      1024       # 1 KB limit
 
-# Max size: 2 KB. Remember: scratchpad is 64 KB by default!
+# Max size: 2 KB. Remember: req_buffers is 128 KB by default!
 .equ MAX_REQUEST_SIZE, MAX_HEADER_SIZE + MAX_BODY_SIZE
+
+# ==============================================================================
+# BSS DATA
+# ==============================================================================
+
+# Ring buffer: divided into 64 1024-byte-sized blocks.
+# Free-list tracked in r15 (check out _start)
+.section .bss
+.align 64
+active_mask: .quad 0                # 64-bit slot tracker (0 = free, 1 = busy)
+
+.align 64
+req_structs: .zero (64 * 64)        # 4 KB: 64 cache-line aligned structs
+
+.align 64
+req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 
 # ==============================================================================
 # STRUCTS
@@ -435,23 +451,6 @@
 .align 16
 
 DEF_SOCKADDR_IN sockaddr_any, 80, 0, 0, 0, 0
-
-
-# ==============================================================================
-# BSS DATA
-# ==============================================================================
-
-# Ring buffer: divided into 64 1024-byte-sized blocks.
-# Free-list tracked in r15 (check out _start)
-.section .bss
-.align 64
-active_mask: .quad 0                # 64-bit slot tracker (0 = free, 1 = busy)
-
-.align 64
-req_structs: .zero (64 * 64)        # 4 KB: 64 cache-line aligned structs
-
-.align 64
-req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 
 # ==============================================================================
 # SYSCALL DEFINITIONS
