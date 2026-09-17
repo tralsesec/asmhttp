@@ -1,21 +1,6 @@
 .intel_syntax noprefix
 
 # ==============================================================================
-# SYSCALL DEFINITIONS
-# ==============================================================================
-.equ SYS_READ,        0
-.equ SYS_WRITE,       1
-.equ SYS_CLOSE,       3
-.equ SYS_WRITEV,     20
-.equ SYS_SOCKET,     41
-.equ SYS_ACCEPT,     43
-.equ SYS_BIND,       49
-.equ SYS_LISTEN,     50
-.equ SYS_SETSOCKOPT, 54
-.equ SYS_FORK,       57
-.equ SYS_EXIT,       60
-
-# ==============================================================================
 # GLOBAL CONSTANTS
 # ==============================================================================
 
@@ -468,6 +453,21 @@ req_structs: .zero (64 * 64)        # 4 KB: 64 cache-line aligned structs
 
 .align 64
 req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
+
+# ==============================================================================
+# SYSCALL DEFINITIONS
+# ==============================================================================
+.equ SYS_READ,        0
+.equ SYS_WRITE,       1
+.equ SYS_CLOSE,       3
+.equ SYS_WRITEV,     20
+.equ SYS_SOCKET,     41
+.equ SYS_ACCEPT,     43
+.equ SYS_BIND,       49
+.equ SYS_LISTEN,     50
+.equ SYS_SETSOCKOPT, 54
+.equ SYS_FORK,       57
+.equ SYS_EXIT,       60
 
 # ==============================================================================
 # CORE SYSCALL MACROS
