@@ -267,6 +267,80 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 .equ HTTP_RESP_SIZE,  16
 
 # ------------------------------------------------------------------------------
+# MACRO: SET_REQ_FLAG flag, base=r12, scr_reg=r10
+# Sets \flag in REQ_OFF_FLAGS on the specified http_request struct.
+#
+# Emits a single, direct 32-bit immediate 'or' if bits fit in 0..30 (positive simm32).
+# Routes through \scr_reg for higher bits to bypass x86-64's missing 'or m64, imm64'.
+#
+# Arguments:
+#   flag:    64-bit flag bitmask or expression to set
+#   base:    Register pointing to http_request base (defaults to r12)
+#   scr_reg: Scratch register for high bits (defaults to r10)
+#
+# Clobbers:
+#   \scr_reg (ONLY when flag exceeds bit 30; untouched on low bits)
+# ------------------------------------------------------------------------------
+.macro SET_REQ_FLAG flag, base=r12, scr_reg=r10
+    .if ((\flag) & ~0x7FFFFFFF)
+        # Bits 31 through 63: load full 64-bit inverted mask into scratch register
+        mov r10, (\flag)
+        or qword ptr [\base + REQ_OFF_FLAGS], \scr_reg
+    .else
+        # Bits 0 through 30: safe to emit direct end
+        or qword ptr [\base + REQ_OFF_FLAGS], (\flag)
+    .endif
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: CLEAR_REQ_FLAG flag, base=r12, scr_reg=r10
+# Clears \flag in REQ_OFF_FLAGS on the specified http_request struct.
+#
+# Emits a direct 'and' if the sign-extended 32-bit immediate safely matches.
+# Otherwise routes through \scr_reg to avoid immediate truncation or sign bugs.
+# ------------------------------------------------------------------------------
+.macro CLEAR_REQ_FLAG flag, base=r12, scr_reg=r10
+    .if ((\flag) >= (1 << 31))
+        # Bits 31 through 63: load full 64-bit inverted mask into scratch register
+        mov \scr_reg, ~(\flag)
+        and qword ptr [\base + REQ_OFF_FLAGS], \scr_reg
+    .else
+        # Bits 0 through 30: safe to emit direct end
+        and qword ptr [\base + REQ_OFF_FLAGS], ~(\flag)
+    .endif
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: TEST_REQ_FLAG flag, base=r12, scr_reg=r10
+# Tests \flag against REQ_OFF_FLAGS on the specified http_request struct.
+#
+# Emits a direct 32-bit immediate 'test' if the mask fits in bits 0..30 (positive simm32).
+# Routes through \scr_reg for higher bits (>= 31) to bypass x86-64's missing 'test m64, imm64'.
+#
+# Arguments:
+#   flag:    64-bit flag bitmask or expression to test
+#   base:    Register pointing to http_request base (defaults to r12)
+#   scr_reg: Scratch register for high bits (defaults to r10)
+#
+# CPU Flags Set:
+#   ZF (Zero Flag) is set to 1 if no bits match (use jz)
+#   ZF (Zero Flag) is cleared to 0 if any bit matches (use jnz)
+#
+# Clobbers:
+#   \scr_reg (ONLY when flag exceeds bit 30; untouched on low bits)
+# ------------------------------------------------------------------------------
+.macro TEST_REQ_FLAG flag, base=r12, scr_reg=r10
+    .if ((\flag) & ~0x7FFFFFFF)
+        # Bits 31 through 63: load full 64-bit inverted mask into scratch register
+        mov \scr_reg, (\flag)
+        test qword ptr [\base + REQ_OFF_FLAGS], \scr_reg
+    .else
+        # Bits 0 through 30: safe to emit direct end
+        test qword ptr [\base + REQ_OFF_FLAGS], (\flag)
+    .endif
+.endm
+
+# ------------------------------------------------------------------------------
 # MACRO: DEF_HTTP_RESP name, buf_label, buf_len, status=200
 # Emits a 16-byte http_response struct.
 # ------------------------------------------------------------------------------
@@ -302,21 +376,36 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 .equ CT_OCTET,          (4 << CT_SHIFT)   # "Content-Type: application/octet-stream\r\n"
 
 # ------------------------------------------------------------------------------
-# MACRO: HTTP_INIT_RESP size=256
+# MACRO: HTTP_ALLOC size=256
 # Reserves an aligned scratchpad on the stack and sets rdi as the write head.
 # size MUST be a multiple of 16 to preserve ABI stack alignment!
+#
+# For request:  use size=64
+# For response: use size=256
 # ------------------------------------------------------------------------------
-.macro HTTP_INIT_RESP size=256
+.macro HTTP_ALLOC size=256
     sub rsp, \size
     mov rdi, rsp
 .endm
 
 # ------------------------------------------------------------------------------
-# MACRO: HTTP_SEND_RESP fd, body_ptr, body_len, alloc_size=256
-# Computes header length, binds pointers to sys_writev, calls the sender,
-# and cleans up the stack scratchpad immediately after sending.
+# MACRO: HTTP_DEALLOC size=256
+# Reserves an aligned scratchpad on the stack and sets rdi as the write head.
+# size MUST be a multiple of 16 to preserve ABI stack alignment!
+#
+# For request:  use size=64
+# For response: use size=256
 # ------------------------------------------------------------------------------
-.macro HTTP_SEND_RESP fd, body_ptr, body_len, alloc_size=256
+.macro HTTP_DEALLOC size=256
+    add rsp, \size
+    mov rdi, rsp
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_SEND_RESP fd, body_ptr, body_len, alloc_size=256
+# Computes header length, binds pointers to sys_writev, calls the sender.
+# ------------------------------------------------------------------------------
+.macro HTTP_SEND_RESP fd, body_ptr, body_len
     # 1. Compute header length before touching rdi
     mov rdx, rdi
     sub rdx, rsp                        # rdx = header length (bytes written)
@@ -328,9 +417,6 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
     mov r8, \body_len                   # r8 = body length
 
     call http_send_response
-
-    # 3. Release scratchpad from stack AFTER sending
-    add rsp, \alloc_size
 .endm
 
 # ------------------------------------------------------------------------------
@@ -443,9 +529,126 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
     add rdi, 2
 .endm
 
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_WRITE_BODY fd, body, len, alloc_size=256
+# Automatically writes Content-Length, appends \r\n, and dispatches via writev.
+#
+# Arguments:
+#   fd:         Client socket descriptor (e.g. r13)
+#   body:       Quoted string literal ("hello") OR pointer to dynamic buffer
+#   len:        [Optional] Length of dynamic buffer (omitted for static strings)
+#
+# Register Safety:
+#   Stashes dynamic arguments in r9/r10 across itoa to avoid clobbering.
+# ------------------------------------------------------------------------------
+.macro HTTP_SEND_BODY fd, body, len
+    .ifb \len
+        # ======================================================================
+        # Branch 1: Static String Literal (Compile-Time Length)
+        # ======================================================================
+        .pushsection .rodata
+    .Lbody_\@:
+        .ascii "\body"
+    .Lbody_end_\@:
+        .equ .Lbody_len_\@, (.Lbody_end_\@ - .Lbody_\@)
+        .popsection
+
+        # 1. Write Content-Length: <len>\r\n using compile-time constant
+        HTTP_WRITE_CONTENT_LENGTH .Lbody_len_\@
+
+        # 2. Terminate HTTP headers with final \r\n
+        HTTP_WRITE_HEADER_END
+
+        # 3. Stream headers + rodata body via writev
+        LOAD_ADDR rax, .Lbody_\@
+        HTTP_SEND_RESP \fd, rax, .Lbody_len_\@
+
+    .else
+        # ======================================================================
+        # Branch 2: Dynamic Buffer (Runtime Pointer + Runtime Length)
+        # ======================================================================
+        # Preserve pointer and length in r9 and r10 across itoa
+        mov r9, \body
+        mov r10, \len
+
+        # 1. Write Content-Length: <len>\r\n using runtime integer
+        HTTP_WRITE_CONTENT_LENGTH r10
+
+        # 2. Terminate HTTP headers with final \r\n
+        HTTP_WRITE_HEADER_END
+
+        # 3. Stream headers + dynamic buffer via writev
+        HTTP_SEND_RESP \fd, r9, r10
+    .endif
+.endm
+
+# ------------------------------------------------------------------------------
+# MACRO: HTTP_SEND_FILE sock_fd, file_fd, file_size, alloc_size=256
+# Writes headers, flushes via sys_write, then streams file via sys_sendfile64.
+# ------------------------------------------------------------------------------
+.macro HTTP_SEND_FILE sock_fd, file_fd, file_size, alloc_size=256
+    # 1. Stash file descriptors and size into non-conflicting registers
+    mov r9, \file_fd
+    mov r10, \file_size
+
+    # 2. Write Content-Length: <file_size>\r\n using safe register r10
+    HTTP_WRITE_CONTENT_LENGTH r10
+
+    # 3. Terminate HTTP headers with final \r\n
+    HTTP_WRITE_HEADER_END
+
+    # 4. itoa is finished, so r8 is now free; stash sock_fd here
+    mov r8, \sock_fd
+
+    # 5. Flush header scratchpad to client socket
+    mov rdx, rdi
+    sub rdx, rsp                        # rdx = header byte count
+    WRITE r8, rsp, rdx                  # SYS_WRITE client_fd, rsp, len
+    add rsp, \alloc_size                # Release stack scratchpad
+
+    # 6. sys_sendfile64(out_fd=r8, in_fd=r9, *offset=NULL, count=r10)
+    # arg3: edx already set
+    # arg4: r10 already holds \file_size
+    SYS2 SYS_SENDFILE, r8, r9
+.endm
+
 # ==============================================================================
 # OPERATIONAL MACROS
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# MACRO: PRINT_STR "string\n"
+# Automatically places text into .rodata, saves registers, and writes to stdout.
+# Clobbers: None (all modified registers are preserved on stack)
+# ------------------------------------------------------------------------------
+.macro PRINT_STR str
+    .pushsection .rodata
+.Lpstr_\@:
+    .ascii "\str"
+.Lpstr_end_\@:
+    .popsection
+
+    # Preserve all registers syscalls or args touch
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r11
+
+    mov eax, SYS_WRITE                   # Syscall 1
+    mov edi, 1                           # stdout
+    lea rsi, [rip + .Lpstr_\@]           # Pointer to .rodata string
+    mov edx, (.Lpstr_end_\@ - .Lpstr_\@) # String length
+    syscall
+
+    pop r11
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+.endm
 
 # ------------------------------------------------------------------------------
 # MACRO: DEF_SOCKADDR_IN name, port, ip1, ip2, ip3, ip4
@@ -529,6 +732,7 @@ status_lookup_table:
 .equ SYS_WRITE,       1
 .equ SYS_CLOSE,       3
 .equ SYS_WRITEV,     20
+.equ SYS_SENDFILE,   40
 .equ SYS_SOCKET,     41
 .equ SYS_ACCEPT,     43
 .equ SYS_BIND,       49
@@ -536,6 +740,7 @@ status_lookup_table:
 .equ SYS_SETSOCKOPT, 54
 .equ SYS_FORK,       57
 .equ SYS_EXIT,       60
+.equ SYS_SCHED_SETAFFINITY, 203
 
 # ==============================================================================
 # CORE SYSCALL MACROS
@@ -624,6 +829,11 @@ status_lookup_table:
     SYS SYS_FORK
 .endm
 
+.macro SCHED_SETAFFINITY pid, cpusetsize, mask
+    # sys_sched_setaffinity(pid=0, cpusetsize=128, mask=rsp)
+    SYS3 SYS_SCHED_SETAFFINITY, \pid, \cpusetsize, \mask
+.endm
+
 .macro EXIT status
     SYS1 SYS_EXIT, \status
 .endm
@@ -659,26 +869,59 @@ worker_event_loop:
     BIND r12, sockaddr_any
     LISTEN r12
 
-    # Accept connection (r13 = client fd)
+    # 1. Accept connection (r13 = client fd)
     ACCEPT r12
     mov r13, rax
+
+    # 2. Claim slot (0..63)
+    call claim_slot
+    cmp rax, -1
+    je .Lserver_busy_503
+    mov r14d, eax
+
+    # 3. Resolve struct and wire buffer from slot_id
+    call get_slot_ptrs                  # rax = req_struct, rdx = wire_buf
+    mov r15, rdx                        # Stash wire_buf in r15 across calls
+
+    # 4. Read HTTP request
+    mov rdi, rax                        # rdi = struct pointer
+    mov rsi, rdx                        # rsi = wire buffer
+    mov edx, r13d                       # edx = client socket fd
+    call http_read_request
+
+    # Print URI path to stdout (e.g. "/")
+    PRINT_STR "URI: "
+
+    movzx eax, word ptr [rdi + REQ_OFF_URI_OFF]
+    movzx edx, word ptr [rdi + REQ_OFF_URI_LEN]
+    lea rsi, [r15 + rax]                # rsi = wire_buf + uri_off
+    WRITE 1, rsi, rdx
+
+    # Print first 64 bytes of the raw wire request to stdout
+    PRINT_STR "\nFirst 256 bytes of request: \n"
+    WRITE 1, r15, 256
+    PRINT_STR "\n"
+
+    # 5. Release slot
+    mov edi, r14d
+    call release_slot
+
+.Lserver_busy_503:
 
     # --------------------------------------------------------------------------
     # Clean Response Lifecycle
     # --------------------------------------------------------------------------
     # 1. Allocate 256-byte scratchpad & set rdi = rsp
-    HTTP_INIT_RESP 256
+    HTTP_ALLOC
 
     # 2. Stream headers lineraly to [rdi]
     HTTP_WRITE_STATUS_LINE 200, 11
     HTTP_WRITE_HEADER_KV "Server", "asmhttp"
     HTTP_WRITE_HEADER_KV "Content-Type", "text/plain"
-    HTTP_WRITE_CONTENT_LENGTH msg_hello_len
-    HTTP_WRITE_HEADER_END
+    HTTP_SEND_BODY r13, "hello"
 
-    # 3. Fire writev and immediately release the 256-byte stack frame
-    LOAD_ADDR rax, msg_hello
-    HTTP_SEND_RESP r13, rax, msg_hello_len, 256
+    # 3. Deallocate scratchpad
+    HTTP_DEALLOC
 
     # 4. Close connection
     CLOSE r13
@@ -716,11 +959,7 @@ http_init:
     bts [rsp], r14
 
     # sys_sched_setaffinity(pid=0, cpusetsize=128, mask=rsp)
-    mov rdi, 0                          # pid 0 = current thread
-    mov rsi, 128                        # size of mask in bytes
-    mov rdx, rsp                        # pointer to cpu_set_t
-    mov rax, SYS_SCHED_SETAFFINITY
-    syscall
+    SCHED_SETAFFINITY 0, 128, rsp
     add rsp, 128
 
     # 2. Worker now runs its own private network setup
@@ -809,20 +1048,58 @@ claim_slot:
     mov rax, rdx                        # rax = claimed slot_id (0..63)
     ret
 
+# ------------------------------------------------------------------------------
+# release_slot(slot_id)
+# In: rdi = slot_id (0..63)
+# ------------------------------------------------------------------------------
+release_slot:
+    mov rax, [rip + active_mask]
+    btr rax, rdi                                 # Reset bit to 0 (mark free)
+    mov [rip + active_mask], rax
+    ret
+
+# ------------------------------------------------------------------------------
+# get_slot_ptrs(slot_id) -> rax (req_struct*), rdx (wire_buf*)
+# In:  rax = slot_id (0..63)
+# Out: rax = pointer to http_request struct
+#      rdx = pointer to 2 KB wire buffer
+# Clobbers: rax, rdx
+# ------------------------------------------------------------------------------
+get_slot_ptrs:
+    mov rdx, rax
+
+    # 1. Struct pointer: base + (slot_id * 64)
+    shl rax, 6
+    lea r8, [rip + req_structs]
+    add r8, rax
+
+    # 2. Wire buffer pointer: base + (slot_id * 2048)
+    shl rdx, 11
+    lea r9, [rip + req_buffers]
+    add r9, rdx
+
+    mov rax, r8
+    mov rdx, r9
+
+    ret
+
 .Lserver_busy:
     mov rax, -1
     ret
 
 # ------------------------------------------------------------------------------
-# http_read_request(*char buf)
-# Reads & parses HTTP request into http_request struct [ZERO-COPY].
-#
+# http_read_request(http_request *req, char *wire_buf, int client_fd)
 # In:
-#   rdi = pointer to start of a 64-byte buffer to write parsed buffer to.
-#         Moves pointer, too.
+#   rdi = pointer to 64-byte http_request struct target
+#   rsi = pointer to wire buffer receiving raw network data
+#   edx = client socket file descriptor (client_fd)
+# Out:
+#   rax = 64-bit parsed flags mask (or -1 on disconnect / socket fault)
+#   rdi = restored pointer to http_request struct base
+# Preserves:
+#   rbx, r12, r13, r14, r15
 # ------------------------------------------------------------------------------
 http_read_request:
-    # Preserve callee-saved registers
     push rbx
     push r12
     push r13
@@ -836,11 +1113,7 @@ http_read_request:
     # --------------------------------------------------------------------------
     # 1. Read wire data from client socket
     # --------------------------------------------------------------------------
-    mov edi, r14d                       # arg1: fd
-    mov rsi, r13                        # arg2: buffer
-    mov edx, MAX_REQUEST_SIZE           # arg3: count
-    mov eax, SYS_READ
-    syscall
+    READ r14, r13, MAX_REQUEST_SIZE
 
     test rax, rax
     jle .Lread_error                    # <= 0: client disconnect or socket fault
@@ -871,6 +1144,7 @@ http_read_request:
     # --------------------------------------------------------------------------
     mov eax, [rsi]
 
+.Lcheck_get:
     # "GET " (0x20544547)
     cmp eax, 0x20544547
     jne .Lcheck_post
@@ -943,7 +1217,7 @@ http_read_request:
 .Lskip_unknown_method:
     cmp rsi, r14
     jae .Lparse_abort
-    lodsb
+    lodsb                               # TODO: mov al, [rsi]; inc rsi might be faster
     cmp al, ' '
     jne .Lskip_unknown_method
 
@@ -970,6 +1244,7 @@ http_read_request:
     jne .Lcheck_dot_traversal
 
     # Hit '?' query delimiter
+    # TODO: probably even store as error instead of ignoring duplicate '?'
     test edx, edx
     jnz .Lskip_char                     # Ignore duplicate '?'
 
@@ -981,7 +1256,7 @@ http_read_request:
     lea rdx, [rsi + 1]                  # rdx = query start address
     sub rdx, r13                        # 16-bit offset from buffer start
     mov [r12 + REQ_OFF_QUERY_OFF], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_QUERY
+    SET_REQ_FLAG REQ_F_HAS_QUERY
     jmp .Lskip_char
 
 .Lcheck_dot_traversal:
@@ -992,7 +1267,7 @@ http_read_request:
     jne .Lskip_char
     cmp byte ptr [rsi + 2], '/'
     jne .Lskip_char
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_BAD_URI
+    SET_REQ_FLAG REQ_F_ERR_BAD_URI
 
 .Lskip_char:
     inc rsi
@@ -1021,7 +1296,7 @@ http_read_request:
     jne .Lcheck_api_prefix
     cmp byte ptr [rbx], '/'
     jne .Lcheck_version
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_PATH_IS_ROOT
+    SET_REQ_FLAG REQ_F_PATH_IS_ROOT
     jmp .Lcheck_version
 
 .Lcheck_api_prefix:
@@ -1031,7 +1306,7 @@ http_read_request:
     jne .Lcheck_static_prefix
     cmp byte ptr [rbx + 4], '/'
     jne .Lcheck_static_prefix
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_PATH_IS_API
+    SET_REQ_FLAG REQ_F_PATH_IS_API
 
 .Lcheck_static_prefix:
     cmp ecx, 8
@@ -1040,7 +1315,7 @@ http_read_request:
     mov rax, 0x2f6369746174732f
     cmp [rbx], rax
     jne .Lcheck_version
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_PATH_IS_STATIC
+    SET_REQ_FLAG REQ_F_PATH_IS_STATIC
 
     # --------------------------------------------------------------------------
     # 5. Parse HTTP Protocol Version
@@ -1055,7 +1330,7 @@ http_read_request:
     mov rbx, 0x312e312f50545448
     cmp rax, rbx
     jne .Lcheck_http_10
-    or qword ptr [r12 + REQ_OFF_FLAGS], (REQ_VER_11 | REQ_F_KEEPALIVE)
+    SET_REQ_FLAG (REQ_VER_11 | REQ_F_KEEPALIVE)
     add rsi, 8
     jmp .Lfind_first_crlf
 
@@ -1076,7 +1351,7 @@ http_read_request:
     jmp .Lfind_first_crlf
 
 .Lbad_version:
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_BAD_VERSION
+    SET_REQ_FLAG REQ_F_ERR_BAD_VERSION
 
 .Lfind_first_crlf:
     cmp rsi, r14
@@ -1164,9 +1439,9 @@ http_read_request:
 .Lmatch_host:
     cmp byte ptr [rsi + 4], ':'
     jne .Lhandle_other_header
-    test qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_HOST
+    TEST_REQ_FLAG REQ_F_HAS_HOST
     jnz .Lerr_multi_host
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_HOST
+    SET_REQ_FLAG REQ_F_HAS_HOST
     add rsi, 5
     call .Lextract_val
     mov [r12 + REQ_OFF_HOST_OFF], ax
@@ -1174,7 +1449,7 @@ http_read_request:
     jmp .Lheader_loop
 
 .Lerr_multi_host:
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_MULTI_HOST
+    SET_REQ_FLAG REQ_F_ERR_MULTI_HOST
     jmp .Lskip_to_crlf
 
 .Lmatch_connection:
@@ -1185,14 +1460,14 @@ http_read_request:
     mov eax, [r13 + rax]
     cmp eax, 0x736f6c63                 # "clos" (close)
     jne .Lcheck_upgrade
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_CLOSE
-    and qword ptr [r12 + REQ_OFF_FLAGS], ~REQ_F_KEEPALIVE
+    SET_REQ_FLAG REQ_F_CLOSE
+    CLEAR_REQ_FLAG REQ_F_KEEPALIVE
     jmp .Lheader_loop
 
 .Lcheck_upgrade:
     cmp eax, 0x72677055                 # "Upgr" (Upgrade)
     jne .Lheader_loop
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_UPGRADE
+    SET_REQ_FLAG REQ_F_UPGRADE
     jmp .Lheader_loop
 
 .Lmatch_content:
@@ -1215,11 +1490,11 @@ http_read_request:
     movzx ecx, dx
     call .Lparse_int
     mov [r12 + REQ_OFF_BODY_LEN], eax
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_BODY
+    SET_REQ_FLAG REQ_F_HAS_BODY
 
     cmp eax, MAX_BODY_SIZE
     jbe .Lheader_loop
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_BODY_LARGE
+    SET_REQ_FLAG REQ_F_ERR_BODY_LARGE
     jmp .Lheader_loop
 
 .Lis_content_type:
@@ -1227,13 +1502,13 @@ http_read_request:
     call .Lextract_val
     mov [r12 + REQ_OFF_CT_OFF], ax
     mov [r12 + REQ_OFF_CT_LEN], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_CT
+    SET_REQ_FLAG REQ_F_HAS_CT
 
     # Check for application/json ("appl")
     mov eax, [r13 + rax]
     cmp eax, 0x6c707061
     jne .Lheader_loop
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_CT_JSON
+    SET_REQ_FLAG REQ_F_CT_JSON
     jmp .Lheader_loop
 
 .Lmatch_ua:
@@ -1241,7 +1516,7 @@ http_read_request:
     call .Lextract_val
     mov [r12 + REQ_OFF_UA_OFF], ax
     mov [r12 + REQ_OFF_UA_LEN], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_UA
+    SET_REQ_FLAG REQ_F_HAS_UA
     jmp .Lheader_loop
 
 .Lmatch_cookie:
@@ -1249,7 +1524,7 @@ http_read_request:
     call .Lextract_val
     mov [r12 + REQ_OFF_COOKIE_OFF], ax
     mov [r12 + REQ_OFF_COOKIE_LEN], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_COOKIE
+    SET_REQ_FLAG REQ_F_HAS_COOKIE
     jmp .Lheader_loop
 
 .Lmatch_auth:
@@ -1257,7 +1532,7 @@ http_read_request:
     call .Lextract_val
     mov [r12 + REQ_OFF_AUTH_OFF], ax
     mov [r12 + REQ_OFF_AUTH_LEN], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_AUTH
+    SET_REQ_FLAG REQ_F_HAS_AUTH
     jmp .Lheader_loop
 
 .Lmatch_referer:
@@ -1265,13 +1540,13 @@ http_read_request:
     call .Lextract_val
     mov [r12 + REQ_OFF_REF_OFF], ax
     mov [r12 + REQ_OFF_REF_LEN], dx
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_REFERER
+    SET_REQ_FLAG REQ_F_HAS_REFERER
     jmp .Lheader_loop
 
 .Lmatch_accept:
     add rsi, 7                          # Skip "Accept:"
     call .Lextract_val
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_ACCEPT
+    SET_REQ_FLAG REQ_F_HAS_ACCEPT
     jmp .Lheader_loop
 
 .Lmatch_transfer_encoding:
@@ -1280,7 +1555,7 @@ http_read_request:
     mov eax, [r13 + rax]
     cmp eax, 0x6e756863                 # "chun" (chunked)
     jne .Lheader_loop
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_CHUNKED
+    SET_REQ_FLAG REQ_F_CHUNKED
     jmp .Lheader_loop
 
 .Lhandle_other_header:
@@ -1306,7 +1581,7 @@ http_read_request:
     jmp .Lheader_loop
 
 .Lhdr_limit_exceeded:
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_HDR_LIMIT
+    SET_REQ_FLAG REQ_F_ERR_HDR_LIMIT
 
 .Lskip_to_crlf:
     cmp rsi, r14
@@ -1332,16 +1607,17 @@ http_read_request:
 
     # RFC 9112 Section 6.1: Reject request smuggling
     # If BOTH Chunked and Content-Length exist, trip error flag
-    test qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_CHUNKED
+    TEST_REQ_FLAG REQ_F_CHUNKED
     jz .Lfinalize_return
-    test qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_HAS_BODY
+    TEST_REQ_FLAG REQ_F_HAS_BODY
     jz .Lfinalize_return
-    or qword ptr [r12 + REQ_OFF_FLAGS], REQ_F_ERR_SMUGGLING
+    SET_REQ_FLAG REQ_F_ERR_SMUGGLING
 
 .Lfinalize_return:
     mov rax, [r12 + REQ_OFF_FLAGS]      # Return flags in rax
 
 .Lparse_abort:
+    mov rdi, r12                        # Restore pointer to struct base
     pop r15
     pop r14
     pop r13
@@ -1350,6 +1626,7 @@ http_read_request:
     ret
 
 .Lread_error:
+    mov rdi, r12                        # Restore pointer to struct base
     mov rax, -1
     pop r15
     pop r14
