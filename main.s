@@ -28,8 +28,6 @@
 # BSS DATA
 # ==============================================================================
 
-# Ring buffer: divided into 64 1024-byte-sized blocks.
-# Free-list tracked in r15 (check out _start)
 .section .bss
 .align 64
 active_mask: .quad 0                # 64-bit slot tracker (0 = free, 1 = busy)
@@ -587,29 +585,29 @@ req_buffers: .zero (64 * 2048)      # 128 KB: 64 raw request buffers (2 KB each)
 # Writes headers, flushes via sys_write, then streams file via sys_sendfile64.
 # ------------------------------------------------------------------------------
 .macro HTTP_SEND_FILE sock_fd, file_fd, file_size, alloc_size=256
-    # 1. Stash file descriptors and size into non-conflicting registers
     mov r9, \file_fd
     mov r10, \file_size
 
-    # 2. Write Content-Length: <file_size>\r\n using safe register r10
+    # 1. Write Content-Length: <file_size>\r\n
     HTTP_WRITE_CONTENT_LENGTH r10
-
-    # 3. Terminate HTTP headers with final \r\n
     HTTP_WRITE_HEADER_END
 
-    # 4. itoa is finished, so r8 is now free; stash sock_fd here
+    # 2. itoa is finished; stash sock_fd in r8
     mov r8, \sock_fd
 
-    # 5. Flush header scratchpad to client socket
+    # 3. Flush headers to client
     mov rdx, rdi
-    sub rdx, rsp                        # rdx = header byte count
-    WRITE r8, rsp, rdx                  # SYS_WRITE client_fd, rsp, len
-    add rsp, \alloc_size                # Release stack scratchpad
+    sub rdx, rsp
+    WRITE r8, rsp, rdx
+    add rsp, \alloc_size
 
-    # 6. sys_sendfile64(out_fd=r8, in_fd=r9, *offset=NULL, count=r10)
-    # arg3: edx already set
-    # arg4: r10 already holds \file_size
-    SYS2 SYS_SENDFILE, r8, r9
+    # 4. sys_sendfile64(out_fd=r8, in_fd=r9, *offset=NULL, count=r10)
+    mov rdi, r8                         # arg1: out_fd (socket)
+    mov rsi, r9                         # arg2: in_fd (disk file)
+    xor edx, edx                        # arg3: NULL offset (sequential stream)
+    # arg4: r10 already holds file_size
+    mov eax, 40                         # SYS_SENDFILE
+    syscall
 .endm
 
 # ==============================================================================
@@ -876,7 +874,7 @@ worker_event_loop:
     # 2. Claim slot (0..63)
     call claim_slot
     cmp rax, -1
-    je .Lserver_busy_503
+    je .Lfailed
     mov r14d, eax
 
     # 3. Resolve struct and wire buffer from slot_id
@@ -889,44 +887,55 @@ worker_event_loop:
     mov edx, r13d                       # edx = client socket fd
     call http_read_request
 
-    # Print URI path to stdout (e.g. "/")
-    PRINT_STR "URI: "
+    # Stash URI offset and length into callee-preserved registers
+    movzx ebx, word ptr [rdi + REQ_OFF_URI_OFF] # URI start offset
+    movzx r14d, word ptr [rdi + REQ_OFF_URI_LEN] # URI length
 
-    movzx eax, word ptr [rdi + REQ_OFF_URI_OFF]
-    movzx edx, word ptr [rdi + REQ_OFF_URI_LEN]
-    lea rsi, [r15 + rax]                # rsi = wire_buf + uri_off
-    WRITE 1, rsi, rdx
+    # Open file: open(r15 + uri_off, O_RDONLY)
+    # (Use [r15 + rbx + 1] if you want relative paths like 'etc/passwd')
+    # 1. Point rdi to start of URI in the wire buffer
+    lea rdi, [r15 + rbx]
 
-    # Print first 64 bytes of the raw wire request to stdout
-    PRINT_STR "\nFirst 256 bytes of request: \n"
-    WRITE 1, r15, 256
-    PRINT_STR "\n"
+    # 2. In-place null-terminate using two registers ([base + index])
+    mov byte ptr [rdi + r14], 0
 
-    # 5. Release slot
-    mov edi, r14d
-    call release_slot
+    # 3. open(rdi, O_RDONLY)
+    xor esi, esi
+    mov eax, 2
+    syscall
 
-.Lserver_busy_503:
+    test eax, eax
+    js .Lfailed
+    mov r12d, eax                       # r12d = file fd
 
-    # --------------------------------------------------------------------------
-    # Clean Response Lifecycle
-    # --------------------------------------------------------------------------
-    # 1. Allocate 256-byte scratchpad & set rdi = rsp
-    HTTP_ALLOC
+    # 4. sys_fstat(fd, statbuf) to obtain exact byte size
+    sub rsp, 144                        # struct stat is 144 bytes on x86-64
+    mov edi, r12d                       # arg1: fd
+    mov rsi, rsp                        # arg2: stat buffer
+    mov eax, 5                          # SYS_NEWFSTAT
+    syscall
 
-    # 2. Stream headers lineraly to [rdi]
+    mov r14, [rsp + 48]                 # st_size is located at offset 48
+    add rsp, 144                        # Clean up stat buffer
+
+    # 5. Send headers with exact Content-Length, then stream the file
+    HTTP_ALLOC 256
     HTTP_WRITE_STATUS_LINE 200, 11
     HTTP_WRITE_HEADER_KV "Server", "asmhttp"
     HTTP_WRITE_HEADER_KV "Content-Type", "text/plain"
-    HTTP_SEND_BODY r13, "hello"
+    HTTP_SEND_FILE r13, r12, r14
 
-    # 3. Deallocate scratchpad
-    HTTP_DEALLOC
-
-    # 4. Close connection
+    # 6. Close both sock_fd and file_fd then exit
+    CLOSE r12
     CLOSE r13
+    EXIT 0
 
-    # Exit program
+.Lfailed:
+    # Quick 404 response
+    HTTP_ALLOC 256
+    HTTP_WRITE_STATUS_LINE 404, 11
+    HTTP_SEND_BODY r13, "404 Not Found\n"
+    CLOSE r13
     EXIT 0
 
 http_init:
