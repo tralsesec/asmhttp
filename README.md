@@ -2,7 +2,7 @@
 
 ![file_read](./examples/fileread.png)
 
-A bare-metal, zero-dependency, zero-copy, concurrent HTTP/1.1 framework written in pure x86-64 assembly for Linux. No libc, no runtime, no bloated dependencies. Just direct syscalls and raw registers.
+A bare-metal, zero-dependency, zero-copy, no-AI slop, highly concurrent HTTP/1.1 framework written in pure x86-64 assembly for Linux. No libc, no runtime, no bloated dependencies. Just direct syscalls and raw registers.
 
 ---
 
