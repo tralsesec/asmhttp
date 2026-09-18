@@ -12,7 +12,7 @@ A bare-metal, zero-dependency, zero-copy, concurrent HTTP/1.1 framework written 
 
 ### Why?
 
-* **For fun and discipline (I know):** In today's tech world, everything has become absurdly cushioned by layers upon layers of abstractions, package managers, and AI assistants doing the heavy lifting. This project goes back to the roots to explore what the CPU and kernel can do when nothing sits in between.
+* **For fun and discipline (I know):** In today's tech world, everything has become absurdly cushioned by layers upon layers of abstractions, package managers, and AI assistants doing the heavy lifting. This project goes back to the roots to explore what the CPU and kernel can do when nothing sits in between. 'Hard time make strong man, strong man make good time, good time make weak man, weak man write asm.'
 * **I'm tired of modern stack bloat:** It is ridiculous that modern backend stacks require a 500 MB+ download, hundreds of megabytes of resident RAM, and thousands of nested function calls just to listen on a TCP socket and serve a small payload. `asmhttp` proves a complete web server can live in single-digit kilobytes of memory and less.
 
 ### How?
