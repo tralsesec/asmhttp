@@ -790,10 +790,9 @@ http_send_response:
 
 # ------------------------------------------------------------------------------
 # claim_slot -> rax (slot_id: 0..63, or -1 if full)
-# Clobbers: rcx, rdx
+# Clobbers: rdx
 # ------------------------------------------------------------------------------
 claim_slot:
-.Lretry_claim:
     mov rax, [rip + active_mask]
     not rax                             # Invert: 1s are now FREE slots
     test rax, rax
@@ -801,9 +800,11 @@ claim_slot:
 
     tzcnt rdx, rax                      # rdx = index of first available free bit (0..63)
 
-    # Atomically try to claim bit rdx
-    lock bts qword ptr [rip + active_mask], rdx
-    jc .Lretry_claim                    # If CF=1, another thread snatched it first, retry!
+    # Because asmhttp runs multi-core and not multi-threaded,
+    # we don't need any atomic operations!
+
+    bts rax, rdx                        # 1 cycle: mark slot busy in register
+    mov [rip + active_mask], rax        # Store updated mask to .bss
 
     mov rax, rdx                        # rax = claimed slot_id (0..63)
     ret
