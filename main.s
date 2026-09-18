@@ -729,6 +729,7 @@ status_lookup_table:
 .equ SYS_READ,        0
 .equ SYS_WRITE,       1
 .equ SYS_CLOSE,       3
+.equ SYS_FSTAT,       5
 .equ SYS_WRITEV,     20
 .equ SYS_SENDFILE,   40
 .equ SYS_SOCKET,     41
@@ -783,6 +784,13 @@ status_lookup_table:
 
 .macro WRITEV fd, iov, iovcnt
     SYS3 SYS_WRITEV, \fd, \iov, \iovcnt
+.endm
+
+.macro FSTAT fd, stat_buf
+    mov edi, \fd
+    mov rsi, \stat_buf
+    mov rax, SYS_FSTAT
+    syscall
 .endm
 
 .macro CLOSE fd
@@ -910,10 +918,7 @@ worker_event_loop:
 
     # 4. sys_fstat(fd, statbuf) to obtain exact byte size
     sub rsp, 144                        # struct stat is 144 bytes on x86-64
-    mov edi, r12d                       # arg1: fd
-    mov rsi, rsp                        # arg2: stat buffer
-    mov eax, 5                          # SYS_NEWFSTAT
-    syscall
+    FSTAT r12d, rsp
 
     mov r14, [rsp + 48]                 # st_size is located at offset 48
     add rsp, 144                        # Clean up stat buffer
