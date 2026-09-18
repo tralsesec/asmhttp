@@ -919,11 +919,12 @@ worker_event_loop:
     add rsp, 144                        # Clean up stat buffer
 
     # 5. Send headers with exact Content-Length, then stream the file
-    HTTP_ALLOC 256
+    HTTP_ALLOC
     HTTP_WRITE_STATUS_LINE 200, 11
     HTTP_WRITE_HEADER_KV "Server", "asmhttp"
     HTTP_WRITE_HEADER_KV "Content-Type", "text/plain"
     HTTP_SEND_FILE r13, r12, r14
+    HTTP_DEALLOC
 
     # 6. Close both sock_fd and file_fd then exit
     CLOSE r12
@@ -932,9 +933,10 @@ worker_event_loop:
 
 .Lfailed:
     # Quick 404 response
-    HTTP_ALLOC 256
+    HTTP_ALLOC
     HTTP_WRITE_STATUS_LINE 404, 11
     HTTP_SEND_BODY r13, "404 Not Found\n"
+    HTTP_DEALLOC
     CLOSE r13
     EXIT 0
 
